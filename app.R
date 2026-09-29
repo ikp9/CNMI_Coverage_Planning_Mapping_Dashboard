@@ -268,8 +268,35 @@ region_color <- function(x) {
   color
 }
 
+# Use an explicit, no-key basemap so maps render consistently after publishing.
+# Keeping the tile URL here also avoids provider-registry changes between local
+# and hosted versions of leaflet/leaflet.providers.
+dashboard_tile_url <- "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+dashboard_tile_attribution <- paste0(
+  "&copy; <a href='https://www.openstreetmap.org/copyright' target='_blank'>",
+  "OpenStreetMap</a> contributors"
+)
+
+dashboard_leaflet <- function(data) {
+  leaflet(
+    data,
+    options = leafletOptions(
+      preferCanvas = TRUE,
+      zoomControl = TRUE
+    )
+  ) |>
+    addTiles(
+      urlTemplate = dashboard_tile_url,
+      attribution = dashboard_tile_attribution,
+      options = tileOptions(minZoom = 2, maxZoom = 19, noWrap = TRUE)
+    )
+}
+
 fit_map_to_data <- function(map, data, default_zoom = 11) {
-  if (nrow(data) == 1) {
+  distinct_locations <- data |>
+    distinct(longitude, latitude)
+
+  if (nrow(distinct_locations) == 1) {
     return(setView(map, data$longitude[[1]], data$latitude[[1]], zoom = default_zoom))
   }
 
@@ -321,7 +348,7 @@ ui <- page_navbar(
       ),
       layout_columns(
         value_box(
-          title = "Children",
+          title = "Children 2 - 83 months",
           value = textOutput("n_children"),
           showcase = bs_icon("people"),
           class = "overview-value-box"
@@ -547,12 +574,11 @@ server <- function(input, output, session) {
     x <- overview_data() |> filter(!is.na(latitude), !is.na(longitude))
     validate(need(nrow(x) > 0, "No mapped villages are available for this selection."))
 
-    map <- leaflet(x) |>
-      addProviderTiles(providers$CartoDB.Positron) |>
+    map <- dashboard_leaflet(x) |>
       addCircleMarkers(
         ~longitude,
         ~latitude,
-        radius = ~pmax(5, sqrt(child_population)),
+        radius = ~pmin(22, pmax(5, sqrt(child_population))),
         color = ~pal_priority(priority_group),
         fillColor = ~pal_priority(priority_group),
         fillOpacity = 0.82,
@@ -583,12 +609,11 @@ server <- function(input, output, session) {
     x <- overview_data() |> filter(!is.na(latitude), !is.na(longitude))
     validate(need(nrow(x) > 0, "No mapped villages are available for this selection."))
 
-    map <- leaflet(x) |>
-      addProviderTiles(providers$CartoDB.Positron) |>
+    map <- dashboard_leaflet(x) |>
       addCircleMarkers(
         ~longitude,
         ~latitude,
-        radius = ~pmax(5, sqrt(child_population)),
+        radius = ~pmin(22, pmax(5, sqrt(child_population))),
         color = ~coverage_color(utd_coverage),
         fillColor = ~coverage_color(utd_coverage),
         fillOpacity = 0.85,
@@ -729,12 +754,11 @@ server <- function(input, output, session) {
       match(input$coverage_map_indicator, coverage_indicator_choices)
     ]
 
-    map <- leaflet(x) |>
-      addProviderTiles(providers$CartoDB.Positron) |>
+    map <- dashboard_leaflet(x) |>
       addCircleMarkers(
         ~longitude,
         ~latitude,
-        radius = ~pmax(5, sqrt(eligible_children)),
+        radius = ~pmin(22, pmax(5, sqrt(eligible_children))),
         color = ~coverage_color(coverage),
         fillColor = ~coverage_color(coverage),
         fillOpacity = 0.85,
@@ -790,8 +814,7 @@ server <- function(input, output, session) {
     x <- planning_reminder_data()
     validate(need(nrow(x) > 0, "No geocoded reminder/recall records are available for this selection."))
 
-    map <- leaflet(x) |>
-      addProviderTiles(providers$CartoDB.Positron) |>
+    map <- dashboard_leaflet(x) |>
       addCircleMarkers(
         ~longitude,
         ~latitude,
