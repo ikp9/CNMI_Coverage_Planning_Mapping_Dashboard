@@ -1,0 +1,69 @@
+:root {
+  --cnmi-navy: #003e73;
+  --cnmi-blue: #0056a6;
+  --cnmi-light-blue: #eaf3fb;
+  --cnmi-text: #1f2933;
+}
+
+body {
+  background: #ffffff;
+  color: var(--cnmi-text);
+}
+
+.navbar {
+  box-shadow: 0 2px 8px rgba(0, 62, 115, 0.18);
+}
+
+.card {
+  border: 1px solid #dce6ef;
+  border-radius: 0.65rem;
+  box-shadow: 0 2px 8px rgba(31, 41, 51, 0.06);
+}
+
+.card-header {
+  background: #f7fafc;
+  color: var(--cnmi-navy);
+  font-weight: 700;
+}
+
+.overview-value-box {
+  min-height: 135px;
+}
+
+.overview-metrics {
+  margin-bottom: 0.75rem;
+}
+
+.small-note {
+  color: #52616b;
+  font-size: 0.88rem;
+  line-height: 1.35;
+}
+
+.map-note {
+  margin: 0.65rem 1rem 0;
+}
+
+.leaflet-container {
+  background: var(--cnmi-light-blue);
+  border-radius: 0.35rem;
+}
+
+.dataTables_wrapper {
+  width: 100%;
+}
+
+table.dataTable thead th {
+  background: var(--cnmi-navy);
+  color: #ffffff;
+}
+
+.bslib-sidebar-layout > .sidebar {
+  background: #f7fafc;
+}
+
+@media (max-width: 768px) {
+  .overview-value-box {
+    min-height: 110px;
+  }
+}

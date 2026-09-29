@@ -1,0 +1,794 @@
+---
+title: "CNMI Child Coverage and Vaccination Planning"
+author: "USAPI Assessment Team | Surveillance & Epidemiology Branch | ISD | NCIRD | CDC"
+date: today
+date-format: long
+params:
+  age_as_of_date: "2026-08-25"
+format:
+  html:
+    theme: flatly
+    toc: true
+    toc-depth: 2
+    number-sections: false
+    code-fold: true
+    code-summary: "Show code"
+    df-print: paged
+    css: ../www/styles.css
+execute:
+  warning: false
+  message: false
+editor:
+  markdown:
+    wrap: 80
+---
+
+This Quarto document imports the three CNMI WebIZ reports, creates the
+patient-level vaccination indicators, applies the CNMI geography rules,
+exports the operational Excel files, and refreshes the dashboard data.
+
+# Setup
+
+```{r}
+#| label: setup
+#| include: false
+
+required_packages <- c(
+  "dplyr", "tidyr", "purrr", "stringr", "lubridate", "readxl",
+  "readr", "janitor", "openxlsx", "here", "tibble", "scales"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    paste0(
+      "Install the following packages before rendering:\n  install.packages(c(",
+      paste0('"', missing_packages, '"', collapse = ", "),
+      "))"
+    ),
+    call. = FALSE
+  )
+}
+
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(lubridate)
+library(readxl)
+library(readr)
+library(janitor)
+library(openxlsx)
+library(here)
+library(tibble)
+
+source(here::here("R", "cnmi_functions.R"), local = TRUE)
+
+project_dir <- here::here()
+data_dir <- here::here("data")
+raw_data_dir <- here::here("data", "Raw Patient Data")
+output_dir <- here::here("data", "Analytic Code Output")
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+analysis_date <- as.Date(params$age_as_of_date)
+if (is.na(analysis_date)) {
+  stop("`params$age_as_of_date` must use YYYY-MM-DD format.", call. = FALSE)
+}
+
+date_stamp <- format(analysis_date, "%m%d%y")
+
+neighborhood_file <- here::here("data", "CNMI_Neighborhood_Coordinates.xlsx")
+region_file <- here::here("data", "CNMI_County_Population_Area_GIS.xlsx")
+
+required_reference_files <- c(neighborhood_file, region_file)
+missing_reference_files <- required_reference_files[!file.exists(required_reference_files)]
+
+if (length(missing_reference_files) > 0) {
+  stop(
+    paste("Required geography file(s) missing:", paste(missing_reference_files, collapse = "\n")),
+    call. = FALSE
+  )
+}
+```
+
+# Input files
+
+The newest matching workbook is selected automatically. File names can include
+a run date; they only need to begin with `Roster`, `Details` (or `Detail`), and
+`RR` (or contain `Reminder`).
+
+```{r}
+#| label: input-files
+#| include: false
+
+roster_file <- newest_matching_file(raw_data_dir, "^Roster.*\\.xlsx$")
+detail_file <- newest_matching_file(raw_data_dir, "^Details?.*\\.xlsx$")
+reminder_file <- newest_matching_file(
+  raw_data_dir,
+  "(^RR.*|.*Reminder.*)\\.xlsx$"
+)
+
+input_inventory <- tibble(
+  report = c("Patient roster", "Patient detail with services", "Reminder/recall"),
+  file = basename(c(roster_file, detail_file, reminder_file))
+)
+
+roster_raw <- readxl::read_excel(roster_file, guess_max = 100000) |>
+  janitor::clean_names()
+detail_raw <- readxl::read_excel(detail_file, guess_max = 100000) |>
+  janitor::clean_names()
+reminder_raw <- readxl::read_excel(reminder_file, guess_max = 100000) |>
+  janitor::clean_names()
+
+if (!"dob" %in% names(roster_raw)) {
+  stop("The roster file must contain a DOB column.", call. = FALSE)
+}
+
+neighborhood_lookup <- read_neighborhood_lookup(neighborhood_file)
+```
+
+```{r}
+#| label: input-inventory
+knitr::kable(input_inventory, caption = "Input reports selected for this run")
+```
+
+# Clean and link patient records
+
+```{r}
+#| label: clean-and-link
+#| include: false
+
+roster_clean <- roster_raw |>
+  mutate(
+    patient_id = extract_patient_id(roster_raw),
+    dob = parse_cnmi_date(dob)
+  )
+
+if ("clinic_status" %in% names(roster_clean)) {
+  roster_clean <- roster_clean |>
+    filter(is.na(clinic_status) | str_to_upper(clinic_status) == "ACTIVE")
+}
+
+roster_clean <- roster_clean |>
+  filter(!is.na(patient_id), !is.na(dob)) |>
+  assign_cnmi_geography(neighborhood_lookup)
+
+vaccine_history <- build_cnmi_vaccine_history(detail_raw)
+
+reminder_recommendations <- coalesce_character_columns(
+  reminder_raw,
+  c(
+    "immunization_recommendations", "immunization_recommendation",
+    "recommendations", "recommendation"
+  )
+)
+
+reminder_clean <- reminder_raw |>
+  mutate(
+    patient_id = extract_patient_id(reminder_raw),
+    immunization_recommendations = reminder_recommendations
+  ) |>
+  filter(!is.na(patient_id)) |>
+  group_by(patient_id) |>
+  summarise(
+    immunization_recommendations = paste(
+      sort(unique(na.omit(immunization_recommendations))),
+      collapse = "; "
+    ),
+    onreminder = 1L,
+    .groups = "drop"
+  )
+
+analytic_full <- roster_clean |>
+  left_join(vaccine_history, by = "patient_id") |>
+  left_join(reminder_clean, by = "patient_id") |>
+  add_cnmi_utd_flags(analysis_date) |>
+  add_cnmi_need_and_product_flags(analysis_date) |>
+  arrange(region, county, age_months, patient_id)
+
+duplicate_patient_ids <- analytic_full |>
+  count(patient_id, name = "rows") |>
+  filter(rows > 1)
+
+if (nrow(duplicate_patient_ids) > 0) {
+  stop(
+    paste0(
+      "The roster contains duplicate patient IDs after cleaning. Review ",
+      "duplicate_patient_ids before exporting."
+    ),
+    call. = FALSE
+  )
+}
+```
+
+# CNMI schedule rules used
+
+The analysis applies the following CNMI-specific rules:
+
+- MMR dose 1 is due beginning at 12 months; MMR dose 2 is not due before 48
+  months.
+- Varicella follows the same routine age anchors: dose 1 at 12-15 months and
+  dose 2 at 4-6 years.
+- HepA begins at 12 months. For a child with one recorded HepA dose, dose 2 is
+  not marked due until at least six months after dose 1.
+
+Source: [AAP Recommended Child and Adolescent Immunization Schedule,
+2026](https://downloads.aap.org/AAP/PDF/AAP-Immunization-Schedule.pdf).
+
+# Export patient-level files
+
+```{r}
+#| label: export-patient-files
+#| include: false
+
+full_dataset_file <- file.path(
+  output_dir,
+  paste0("Dataset 1_CNMI_2-83 Mos_Full Dataset_", date_stamp, ".xlsx")
+)
+
+deid_dataset_file <- file.path(
+  output_dir,
+  paste0("Dataset 2_CNMI_2-83 Mos_DeID_Full_Dataset_", date_stamp, ".xlsx")
+)
+
+patients_needing_file <- file.path(
+  output_dir,
+  paste0("CNMI_Patients_Needing_Vaccination_", date_stamp, ".xlsx")
+)
+
+missing_coordinates_file <- file.path(output_dir, "Missing_Coordinates.xlsx")
+
+direct_identifier_columns <- c(
+  "patient_name", "first_name", "middle_name", "last_name", "full_name",
+  "primary_contact_lastname_firstname", "primary_contact_name",
+  "telephone", "cell_phone", "phone", "email",
+  "address_line_1", "address_line_2", "address", "zip", "postal_code",
+  "medical_record_number", "mrn", "dob"
+)
+
+patient_id_crosswalk <- analytic_full |>
+  distinct(patient_id) |>
+  arrange(patient_id) |>
+  mutate(dashboard_patient_id = sprintf("CNMI%06d", row_number()))
+
+analytic_deid <- analytic_full |>
+  left_join(patient_id_crosswalk, by = "patient_id") |>
+  select(-any_of(c("patient_id", direct_identifier_columns))) |>
+  rename(patient_id = dashboard_patient_id) |>
+  relocate(patient_id)
+
+need_columns <- unname(CNMI_VACCINE_NEED_MAP)
+product_columns <- unname(CNMI_PRODUCT_MAP)
+
+patients_needing <- analytic_full |>
+  filter(
+    onreminder == 1 |
+      if_any(all_of(need_columns), ~dplyr::coalesce(as.logical(.x), FALSE))
+  ) |>
+  select(
+    any_of(c(
+      "patient_id", "first_name", "last_name", "patient_name", "dob",
+      "age_months", "age_group_label", "region", "county",
+      "primary_contact_lastname_firstname", "telephone", "cell_phone",
+      "address_line_1", "address_line_2", "immunization_recommendations"
+    )),
+    all_of(need_columns),
+    all_of(product_columns),
+    any_of(c("mmr1utd", "mmr_utd", "var_utd", "hepa_utd"))
+  ) |>
+  # Do not need MMR2UTD in this operational file as in other jurisdictions.
+  select(-any_of("mmr2utd"))
+
+missing_coordinates <- analytic_deid |>
+  filter(county != "Unknown", is.na(latitude) | is.na(longitude)) |>
+  distinct(region, county) |>
+  arrange(region, county)
+
+openxlsx::write.xlsx(
+  analytic_full, full_dataset_file,
+  asTable = nrow(analytic_full) > 0, overwrite = TRUE
+)
+openxlsx::write.xlsx(
+  analytic_deid, deid_dataset_file,
+  asTable = nrow(analytic_deid) > 0, overwrite = TRUE
+)
+openxlsx::write.xlsx(
+  patients_needing, patients_needing_file,
+  asTable = nrow(patients_needing) > 0, overwrite = TRUE
+)
+openxlsx::write.xlsx(
+  missing_coordinates, missing_coordinates_file,
+  asTable = nrow(missing_coordinates) > 0, overwrite = TRUE
+)
+```
+
+# Create dashboard data
+
+```{r}
+#| label: create-dashboard-data
+#| include: false
+
+source(here::here("R", "prepare_data.R"), local = TRUE)
+```
+
+# Create formatted Excel tables
+
+```{r}
+#| label: create-excel-tables
+#| include: false
+
+region_levels <- c("CNMI", "Saipan", "Rota", "Tinian")
+age_levels <- c(
+  "2-3 months", "4-5 months", "6-11 months", "12-18 months",
+  "19-35 months", "3 years", "4 years", "5 years", "6 years"
+)
+
+dose_coverage_label <- function(age_group, vaccine) {
+  case_when(
+    age_group == "2-3 months" & vaccine == "DTaP" ~ "≥1 DTaP",
+    age_group == "2-3 months" & vaccine == "IPV" ~ "≥1 IPV",
+    age_group == "2-3 months" & vaccine == "Hib" ~ "≥1 Hib",
+    age_group == "2-3 months" & vaccine == "HepB" ~ "≥2 HepB",
+    age_group == "2-3 months" & vaccine == "PCV" ~ "≥1 PCV",
+    age_group == "2-3 months" & vaccine == "Rotavirus" ~ "≥1 Rotavirus",
+
+    age_group == "4-5 months" & vaccine == "DTaP" ~ "≥2 DTaP",
+    age_group == "4-5 months" & vaccine == "IPV" ~ "≥2 IPV",
+    age_group == "4-5 months" & vaccine == "Hib" ~ "≥2 Hib",
+    age_group == "4-5 months" & vaccine == "HepB" ~ "≥2 HepB",
+    age_group == "4-5 months" & vaccine == "PCV" ~ "≥2 PCV",
+    age_group == "4-5 months" & vaccine == "Rotavirus" ~ "≥2 Rotavirus",
+
+    age_group == "6-11 months" & vaccine == "DTaP" ~ "≥3 DTaP",
+    age_group == "6-11 months" & vaccine == "IPV" ~ "≥3 IPV",
+    age_group == "6-11 months" & vaccine == "Hib" ~ "≥2 Hib",
+    age_group == "6-11 months" & vaccine == "HepB" ~ "≥3 HepB",
+    age_group == "6-11 months" & vaccine == "PCV" ~ "≥3 PCV",
+    age_group == "6-11 months" & vaccine == "Rotavirus" ~ "≥3 Rotavirus",
+
+    age_group %in% c("12-18 months", "19-35 months", "3 years") & vaccine == "DTaP" ~ "≥4 DTaP",
+    age_group %in% c("12-18 months", "19-35 months", "3 years") & vaccine == "IPV" ~ "≥3 IPV",
+    age_group %in% c("12-18 months", "19-35 months", "3 years") & vaccine == "MMR" ~ "≥1 MMR",
+    age_group %in% c("12-18 months", "19-35 months", "3 years") & vaccine == "Hib" ~ "≥3 Hib",
+    age_group %in% c("12-18 months", "19-35 months", "3 years") & vaccine == "HepB" ~ "≥3 HepB",
+    age_group %in% c("12-18 months", "19-35 months", "3 years") & vaccine == "PCV" ~ "≥4 PCV",
+    age_group %in% c("12-18 months", "19-35 months", "3 years") & vaccine == "Rotavirus" ~ "≥3 Rotavirus",
+    age_group %in% c("12-18 months", "19-35 months", "3 years") & vaccine == "Varicella" ~ "≥1 Varicella",
+    age_group %in% c("12-18 months", "19-35 months", "3 years") & vaccine == "HepA" ~ "≥1 HepA (dose 2 if due)",
+
+    age_group %in% c("4 years", "5 years", "6 years") & vaccine == "DTaP" ~ "≥4 DTaP*",
+    age_group %in% c("4 years", "5 years", "6 years") & vaccine == "IPV" ~ "≥3 IPV*",
+    age_group %in% c("4 years", "5 years", "6 years") & vaccine == "MMR" ~ "≥2 MMR",
+    age_group %in% c("4 years", "5 years", "6 years") & vaccine == "Hib" ~ "≥3 Hib",
+    age_group %in% c("4 years", "5 years", "6 years") & vaccine == "HepB" ~ "≥3 HepB",
+    age_group %in% c("4 years", "5 years", "6 years") & vaccine == "PCV" ~ "≥4 PCV",
+    age_group %in% c("4 years", "5 years", "6 years") & vaccine == "Rotavirus" ~ "≥3 Rotavirus",
+    age_group %in% c("4 years", "5 years", "6 years") & vaccine == "Varicella" ~ "≥2 Varicella",
+    age_group %in% c("4 years", "5 years", "6 years") & vaccine == "HepA" ~ "≥1 HepA (dose 2 if due)",
+    TRUE ~ NA_character_
+  )
+}
+
+with_cnmi_total <- function(data, grouping, summarise_expression) {
+  region_rows <- data |>
+    group_by(across(all_of(c("region", grouping)))) |>
+    summarise(!!!summarise_expression, .groups = "drop")
+
+  total_rows <- data |>
+    group_by(across(all_of(grouping))) |>
+    summarise(!!!summarise_expression, .groups = "drop") |>
+    mutate(region = "CNMI", .before = 1)
+
+  bind_rows(total_rows, region_rows) |>
+    mutate(region = factor(region, levels = region_levels)) |>
+    arrange(region, !!!rlang::syms(grouping)) |>
+    mutate(region = as.character(region))
+}
+
+denominator_table <- with_cnmi_total(
+  analytic_deid,
+  "age_group_label",
+  rlang::list2(Children = rlang::expr(n_distinct(patient_id)))
+) |>
+  mutate(age_group_label = factor(age_group_label, levels = age_levels)) |>
+  arrange(factor(region, levels = region_levels), age_group_label) |>
+  transmute(Region = region, `Age group` = as.character(age_group_label), Children)
+
+reminder_by_village_detail <- analytic_deid |>
+  filter(onreminder == 1) |>
+  count(region, county, name = "Children on reminder/recall") |>
+  rename(Region = region, Village = county)
+
+reminder_by_village_total <- analytic_deid |>
+  filter(onreminder == 1) |>
+  summarise(`Children on reminder/recall` = n_distinct(patient_id)) |>
+  mutate(Region = "CNMI", Village = "CNMI Total", .before = 1)
+
+reminder_by_village <- bind_rows(reminder_by_village_total, reminder_by_village_detail) |>
+  arrange(factor(Region, levels = region_levels), Village)
+
+vaccine_needs_detail <- analytic_deid |>
+  select(region, county, all_of(need_columns)) |>
+  pivot_longer(all_of(need_columns), names_to = "need_variable", values_to = "needed") |>
+  mutate(
+    Vaccine = names(CNMI_VACCINE_NEED_MAP)[match(need_variable, CNMI_VACCINE_NEED_MAP)]
+  ) |>
+  group_by(region, county, Vaccine) |>
+  summarise(`Children due` = sum(needed == 1, na.rm = TRUE), .groups = "drop") |>
+  rename(Region = region, Village = county)
+
+vaccine_needs_total <- analytic_deid |>
+  select(all_of(need_columns)) |>
+  pivot_longer(all_of(need_columns), names_to = "need_variable", values_to = "needed") |>
+  mutate(Vaccine = names(CNMI_VACCINE_NEED_MAP)[match(need_variable, CNMI_VACCINE_NEED_MAP)]) |>
+  group_by(Vaccine) |>
+  summarise(`Children due` = sum(needed == 1, na.rm = TRUE), .groups = "drop") |>
+  mutate(Region = "CNMI", Village = "CNMI Total", .before = 1)
+
+vaccine_needs_table <- bind_rows(vaccine_needs_total, vaccine_needs_detail) |>
+  arrange(factor(Region, levels = region_levels), Village, Vaccine)
+
+product_needs_detail <- analytic_deid |>
+  select(region, county, all_of(product_columns)) |>
+  pivot_longer(all_of(product_columns), names_to = "product_variable", values_to = "needed") |>
+  mutate(
+    Product = names(CNMI_PRODUCT_MAP)[match(product_variable, CNMI_PRODUCT_MAP)]
+  ) |>
+  group_by(region, county, Product) |>
+  summarise(`Doses needed` = sum(needed == 1, na.rm = TRUE), .groups = "drop") |>
+  rename(Region = region, Village = county)
+
+product_needs_total <- analytic_deid |>
+  select(all_of(product_columns)) |>
+  pivot_longer(all_of(product_columns), names_to = "product_variable", values_to = "needed") |>
+  mutate(Product = names(CNMI_PRODUCT_MAP)[match(product_variable, CNMI_PRODUCT_MAP)]) |>
+  group_by(Product) |>
+  summarise(`Doses needed` = sum(needed == 1, na.rm = TRUE), .groups = "drop") |>
+  mutate(Region = "CNMI", Village = "CNMI Total", .before = 1)
+
+product_needs_table <- bind_rows(product_needs_total, product_needs_detail) |>
+  arrange(factor(Region, levels = region_levels), Village, Product)
+
+dose_coverage_detail <- analytic_deid |>
+  select(region, age_group_label, all_of(unname(CNMI_COVERAGE_MAP))) |>
+  pivot_longer(
+    all_of(unname(CNMI_COVERAGE_MAP)),
+    names_to = "coverage_variable",
+    values_to = "utd"
+  ) |>
+  mutate(
+    Vaccine = names(CNMI_COVERAGE_MAP)[match(coverage_variable, CNMI_COVERAGE_MAP)]
+  ) |>
+  group_by(region, age_group_label, Vaccine) |>
+  summarise(
+    Denominator = sum(!is.na(utd)),
+    `Children UTD` = sum(utd == 1, na.rm = TRUE),
+    `% UTD` = if_else(Denominator > 0, 100 * `Children UTD` / Denominator, NA_real_),
+    .groups = "drop"
+  ) |>
+  rename(Region = region, `Age group` = age_group_label)
+
+dose_coverage_total <- analytic_deid |>
+  select(age_group_label, all_of(unname(CNMI_COVERAGE_MAP))) |>
+  pivot_longer(
+    all_of(unname(CNMI_COVERAGE_MAP)),
+    names_to = "coverage_variable",
+    values_to = "utd"
+  ) |>
+  mutate(Vaccine = names(CNMI_COVERAGE_MAP)[match(coverage_variable, CNMI_COVERAGE_MAP)]) |>
+  group_by(age_group_label, Vaccine) |>
+  summarise(
+    Denominator = sum(!is.na(utd)),
+    `Children UTD` = sum(utd == 1, na.rm = TRUE),
+    `% UTD` = if_else(Denominator > 0, 100 * `Children UTD` / Denominator, NA_real_),
+    .groups = "drop"
+  ) |>
+  mutate(Region = "CNMI", .before = 1) |>
+  rename(`Age group` = age_group_label)
+
+dose_coverage_table <- bind_rows(dose_coverage_total, dose_coverage_detail) |>
+  filter(Denominator > 0) |>
+  mutate(
+    vaccine_order = match(Vaccine, names(CNMI_COVERAGE_MAP)),
+    Vaccine = dose_coverage_label(`Age group`, Vaccine)
+  ) |>
+  filter(!is.na(Vaccine)) |>
+  arrange(
+    factor(Region, levels = region_levels),
+    factor(`Age group`, levels = age_levels),
+    vaccine_order
+  ) |>
+  select(-vaccine_order)
+
+utd_by_village_detail <- analytic_deid |>
+  group_by(region, county, age_group_label) |>
+  summarise(
+    Denominator = n_distinct(patient_id),
+    `Children UTD` = sum(utd == 1, na.rm = TRUE),
+    `% UTD for age` = 100 * mean(utd == 1, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  rename(Region = region, Village = county, `Age group` = age_group_label)
+
+utd_by_village_total <- analytic_deid |>
+  group_by(age_group_label) |>
+  summarise(
+    Denominator = n_distinct(patient_id),
+    `Children UTD` = sum(utd == 1, na.rm = TRUE),
+    `% UTD for age` = 100 * mean(utd == 1, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(Region = "CNMI", Village = "CNMI Total", .before = 1) |>
+  rename(`Age group` = age_group_label)
+
+utd_by_village <- bind_rows(utd_by_village_total, utd_by_village_detail) |>
+  arrange(factor(Region, levels = region_levels), Village, factor(`Age group`, levels = age_levels))
+
+coverage_19_35_detail <- analytic_deid |>
+  filter(between(age_months, 19, 35)) |>
+  select(region, all_of(unname(CNMI_COVERAGE_MAP))) |>
+  pivot_longer(
+    all_of(unname(CNMI_COVERAGE_MAP)),
+    names_to = "coverage_variable",
+    values_to = "utd"
+  ) |>
+  mutate(Vaccine = names(CNMI_COVERAGE_MAP)[match(coverage_variable, CNMI_COVERAGE_MAP)]) |>
+  group_by(region, Vaccine) |>
+  summarise(
+    Denominator = sum(!is.na(utd)),
+    `Children UTD` = sum(utd == 1, na.rm = TRUE),
+    `% UTD` = if_else(Denominator > 0, 100 * `Children UTD` / Denominator, NA_real_),
+    .groups = "drop"
+  ) |>
+  rename(Region = region)
+
+coverage_19_35_total <- analytic_deid |>
+  filter(between(age_months, 19, 35)) |>
+  select(all_of(unname(CNMI_COVERAGE_MAP))) |>
+  pivot_longer(
+    everything(),
+    names_to = "coverage_variable",
+    values_to = "utd"
+  ) |>
+  mutate(Vaccine = names(CNMI_COVERAGE_MAP)[match(coverage_variable, CNMI_COVERAGE_MAP)]) |>
+  group_by(Vaccine) |>
+  summarise(
+    Denominator = sum(!is.na(utd)),
+    `Children UTD` = sum(utd == 1, na.rm = TRUE),
+    `% UTD` = if_else(Denominator > 0, 100 * `Children UTD` / Denominator, NA_real_),
+    .groups = "drop"
+  ) |>
+  mutate(Region = "CNMI", .before = 1)
+
+coverage_19_35 <- bind_rows(coverage_19_35_total, coverage_19_35_detail) |>
+  arrange(factor(Region, levels = region_levels), Vaccine)
+
+series_19_35_patient <- analytic_deid |>
+  filter(between(age_months, 19, 35)) |>
+  mutate(
+    `4:3:1:3:3:4 series` = as.integer(
+      dtap4utd == 1 & ipv3utd == 1 & mmr1utd == 1 &
+        hib3utd == 1 & hepb3utd == 1 & pcv4utd == 1
+    ),
+    `Routine series + Varicella + HepA` = as.integer(
+      `4:3:1:3:3:4 series` == 1 & var1utd == 1 & hepa_utd == 1
+    )
+  )
+
+series_19_35_detail <- series_19_35_patient |>
+  select(region, `4:3:1:3:3:4 series`, `Routine series + Varicella + HepA`) |>
+  pivot_longer(-region, names_to = "Series", values_to = "utd") |>
+  group_by(region, Series) |>
+  summarise(
+    Denominator = n(),
+    `Children UTD` = sum(utd == 1, na.rm = TRUE),
+    `% UTD` = 100 * mean(utd == 1, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  rename(Region = region)
+
+series_19_35_total <- series_19_35_patient |>
+  select(`4:3:1:3:3:4 series`, `Routine series + Varicella + HepA`) |>
+  pivot_longer(everything(), names_to = "Series", values_to = "utd") |>
+  group_by(Series) |>
+  summarise(
+    Denominator = n(),
+    `Children UTD` = sum(utd == 1, na.rm = TRUE),
+    `% UTD` = 100 * mean(utd == 1, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(Region = "CNMI", .before = 1)
+
+series_19_35 <- bind_rows(series_19_35_total, series_19_35_detail) |>
+  arrange(factor(Region, levels = region_levels), Series)
+
+table_workbook_file <- file.path(
+  output_dir,
+  paste0("CNMI_Child_Coverage_Planning_Tables_", date_stamp, ".xlsx")
+)
+
+title_style <- createStyle(
+  fontSize = 13,
+  textDecoration = "bold",
+  fontColour = "#FFFFFF",
+  fgFill = "#0056A6",
+  halign = "left",
+  valign = "center",
+  wrapText = TRUE
+)
+
+header_style <- createStyle(
+  textDecoration = "bold",
+  fontColour = "#FFFFFF",
+  fgFill = "#003E73",
+  halign = "center",
+  valign = "center",
+  wrapText = TRUE,
+  border = "TopBottomLeftRight",
+  borderColour = "#FFFFFF"
+)
+
+footnote_style <- createStyle(fontSize = 9, fontColour = "#495057", wrapText = TRUE)
+percent_style <- createStyle(numFmt = "0.0", halign = "center")
+integer_style <- createStyle(numFmt = "#,##0", halign = "center")
+
+write_table_sheet <- function(wb, sheet, title, data, footnotes = character()) {
+  addWorksheet(wb, sheet, gridLines = FALSE)
+  n_cols <- max(ncol(data), 1)
+  n_rows <- nrow(data)
+  data_start <- 4
+
+  writeData(wb, sheet, title, startRow = 1, startCol = 1, colNames = FALSE)
+  mergeCells(wb, sheet, cols = 1:n_cols, rows = 1)
+  addStyle(wb, sheet, title_style, rows = 1, cols = 1:n_cols, gridExpand = TRUE)
+  setRowHeights(wb, sheet, rows = 1, heights = 34)
+
+  writeData(wb, sheet, data, startRow = 3, startCol = 1, keepNA = FALSE)
+  addStyle(wb, sheet, header_style, rows = 3, cols = 1:n_cols, gridExpand = TRUE)
+  addFilter(wb, sheet, rows = 3, cols = 1:n_cols)
+
+  if (n_rows > 0) {
+    body_rows <- data_start:(data_start + n_rows - 1)
+    percent_cols <- which(str_detect(names(data), "^%"))
+    integer_cols <- which(str_detect(names(data), "Children|Denominator|Doses"))
+
+    if (length(percent_cols) > 0) {
+      addStyle(wb, sheet, percent_style, rows = body_rows, cols = percent_cols, gridExpand = TRUE)
+    }
+    if (length(integer_cols) > 0) {
+      addStyle(wb, sheet, integer_style, rows = body_rows, cols = integer_cols, gridExpand = TRUE)
+    }
+  }
+
+  if (length(footnotes) > 0) {
+    footnote_start <- data_start + n_rows + 1
+    for (i in seq_along(footnotes)) {
+      row <- footnote_start + i - 1
+      writeData(wb, sheet, footnotes[[i]], startRow = row, startCol = 1, colNames = FALSE)
+      mergeCells(wb, sheet, cols = 1:n_cols, rows = row)
+      addStyle(wb, sheet, footnote_style, rows = row, cols = 1:n_cols, gridExpand = TRUE)
+    }
+  }
+
+  freezePane(wb, sheet, firstActiveRow = 4)
+  setColWidths(wb, sheet, cols = 1:n_cols, widths = "auto")
+}
+
+schedule_footnotes <- c(
+  "MMR and varicella dose 2 are not required before age 4 years (48 months).",
+  "HepA dose 2 is due at least 6 months after dose 1.",
+  "Schedule source: https://downloads.aap.org/AAP/PDF/AAP-Immunization-Schedule.pdf"
+)
+
+wb <- createWorkbook()
+
+write_table_sheet(
+  wb, "IIS Denominator",
+  paste0("Active CNMI IIS patients aged 2-83 months, by region and age group - ", year(analysis_date)),
+  denominator_table
+)
+write_table_sheet(
+  wb, "Reminder by Village",
+  paste0("Children on reminder/recall, by CNMI region and village - ", year(analysis_date)),
+  reminder_by_village
+)
+write_table_sheet(
+  wb, "Needs by Vaccine",
+  paste0("Children needing vaccination, by CNMI region, village, and vaccine - ", year(analysis_date)),
+  vaccine_needs_table,
+  schedule_footnotes
+)
+write_table_sheet(
+  wb, "Products Needed",
+  paste0("Estimated vaccine products needed, by CNMI region and village - ", year(analysis_date)),
+  product_needs_table,
+  "Product estimates are planning counts; clinical review is required before administration."
+)
+write_table_sheet(
+  wb, "Dose Coverage",
+  paste0("Age-appropriate vaccination coverage, by CNMI region and age group - ", year(analysis_date)),
+  dose_coverage_table,
+  c(
+    schedule_footnotes,
+    paste0(
+      "* DTaP is up to date with 5 doses, or 4 when dose 4 was given at age 48 months or older; ",
+      "IPV is up to date with 4 doses, or 3 when dose 3 was given at age 48 months or older."
+    )
+  )
+)
+write_table_sheet(
+  wb, "UTD by Village",
+  paste0("Up-to-date status, by CNMI region, village, and age group - ", year(analysis_date)),
+  utd_by_village,
+  schedule_footnotes
+)
+write_table_sheet(
+  wb, "Coverage 19-35 Months",
+  paste0("Vaccination coverage among children aged 19-35 months, by CNMI region - ", year(analysis_date)),
+  coverage_19_35,
+  schedule_footnotes
+)
+write_table_sheet(
+  wb, "Series 19-35 Months",
+  paste0("Vaccination series coverage among children aged 19-35 months, by CNMI region - ", year(analysis_date)),
+  series_19_35,
+  c(
+    "4:3:1:3:3:4 = >=4 DTaP, >=3 IPV, >=1 MMR, >=3 Hib, >=3 HepB, and >=4 PCV.",
+    "The expanded routine series adds >=1 varicella dose and age-appropriate HepA status."
+  )
+)
+
+saveWorkbook(wb, table_workbook_file, overwrite = TRUE)
+```
+
+# Run summary
+
+```{r}
+#| label: run-summary
+
+run_summary <- tibble(
+  Measure = c(
+    "Active children aged 2-83 months",
+    "Children UTD for age",
+    "Children on reminder/recall",
+    "Villages without coordinates"
+  ),
+  Value = c(
+    n_distinct(analytic_deid$patient_id),
+    sum(analytic_deid$utd == 1, na.rm = TRUE),
+    sum(analytic_deid$onreminder == 1, na.rm = TRUE),
+    nrow(missing_coordinates)
+  )
+)
+
+knitr::kable(run_summary)
+```
+
+Files created in `data/Analytic Code Output`:
+
+```{r}
+#| label: output-files
+#| echo: false
+
+tibble(
+  Output = c(
+    "Full patient-level dataset",
+    "Deidentified dashboard dataset",
+    "Patients needing vaccination",
+    "Formatted planning tables",
+    "Missing-coordinate QA"
+  ),
+  File = basename(c(
+    full_dataset_file,
+    deid_dataset_file,
+    patients_needing_file,
+    table_workbook_file,
+    missing_coordinates_file
+  ))
+) |>
+  knitr::kable()
+```

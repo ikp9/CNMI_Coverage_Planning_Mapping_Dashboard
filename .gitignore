@@ -1,0 +1,32 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+.quarto/
+analysis/*_files/
+analysis/*.html
+analysis/*.pdf
+analysis/*.docx
+
+# Raw files and analytic outputs may contain PII or sensitive patient data.
+data/Raw Patient Data/*
+!data/Raw Patient Data/.gitkeep
+
+#Ignore topline archive folder
+Archive/
+
+# Ignore the Archive folder containing PII
+data/Analytic Code Output/Archive
+
+# Ignore Dataset 1 with any date suffix or extension
+data/Analytic Code Output/Dataset 1_FSM_*
+
+# Ignore Patients Needing Vaccination with any date suffix or extension
+data/Analytic Code Output/FSM_Patients_Needing_Vaccination_*
+
+# Generated dashboard data are reproducible and should not be committed by default.
+data/community_summary.csv
+data/community_vaccine_needs.csv
+data/community_product_needs.csv
+data/patient_dashboard.csv
+data/qa_cnmi_geography.csv
